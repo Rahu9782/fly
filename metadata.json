@@ -1,0 +1,6 @@
+{
+  "name": "Flylang",
+  "description": "An AI-powered application that reads and interprets ICAO-style NOTAMs and automatically generates valid AIRlang rules for use on the Navblue NOTAM Rule Writer platform.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
