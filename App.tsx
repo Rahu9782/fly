@@ -1,505 +1,198 @@
+# --- app.py or main.py ---
+from flask import Flask, request, jsonify, render_template
+import re
+from datetime import datetime, timedelta
+import spacy
 
-import React, { useState, useCallback } from 'react';
-import { NotamInput } from './components/NotamInput';
-import { ParsedOutput } from './components/ParsedOutput';
-import { AirlangOutput } from './components/AirlangOutput';
-import { AlertTriangle, ClipboardList, FileText } from 'lucide-react';
-import { ParsedNotam, NotamType, AreaDefinition } from './types';
-import { parseNotamWithAI } from './services/geminiService';
-import { formatAirlangDate } from './utils/dateFormatter';
+# Load the spaCy model once for efficiency
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    print("Downloading spaCy model 'en_core_web_sm'...")
+    from spacy.cli import download
+    download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
-const MONTH_INDEX_MAP: { [key: string]: number } = {
-    "JAN": 0, "FEB": 1, "MAR": 2, "APR": 3, "MAY": 4, "JUN": 5, 
-    "JUL": 6, "AUG": 7, "SEP": 8, "OCT": 9, "NOV": 10, "DEC": 11
-};
+app = Flask(__name__)
 
-const WEEK_DAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+# ############################################################################
+# ## THE UNIFIED NOTAM DECODER CLASS
+# ############################################################################
 
+class NotamDecoder:
+    """
+    A comprehensive NOTAM decoder that parses raw text and translates it into
+    a structured AIRlang rule. It uses a hybrid regex/NLP approach to handle
+    various NOTAM formats for runways, restricted areas, and schedules.
+    """
+    def __init__(self, notam_text):
+        # --- Raw Data ---
+        self.raw_text = notam_text
 
-const formatAirlangCoordinate = (coord: string): string => {
-    // Matches DDMMSSN/S and DDDMMSS E/W, and returns DDMMN/S and DDDMMW/E
-    const match = coord.match(/^(\d{4})\d*([NS])(\d{5})\d*([EW])$/);
-    if (match) {
-        const [, latDegMin, latDir, lonDegMin, lonDir] = match;
-        return `${latDegMin}${latDir}${lonDegMin}${lonDir}+A+P`;
-    }
-    // Fallback for unexpected formats.
-    return `${coord}+A+P`;
-};
+        # --- Parsed Header & Core Info ---
+        self.notam_id = None
+        self.airport = None
+        self.q_code = None
+        self.notam_type = "UNKNOWN" # Will be 'AREA', 'RUNWAY', etc.
+        self.start_time = None
+        self.end_time = None
 
-const feetToFlightLevel = (feet: number): string => {
-    const fl = Math.round(feet / 100);
-    return `FL${String(fl).padStart(3, '0')}`;
-};
+        # --- Parsed Body Details ---
+        self.schedule = {'type': 'CONTINUOUS', 'rules': {}}
+        self.geometry = {} # For polygons or circles
+        self.vertical_limits = {'lower': 'SFC', 'upper': 'UNL'}
+        self.subject = {} # For runway number, status, etc.
+        self.details = ""
 
-const generateAirlang = (data: ParsedNotam): { code: string; error?: string } => {
-    let timeDef = '';
+        # --- Begin the decoding process ---
+        self._decode()
 
-    if (data.recurringSchedule && data.recurringSchedule.clauses?.length > 0) {
-        const { timeDefName, clauses } = data.recurringSchedule;
-        const name = timeDefName || 'DURATION';
-        const overallStartFmt = data.startTime ? formatAirlangDate(data.startTime) : 'INVALID_START_DATE';
-        const overallEndFmt = data.endTime ? formatAirlangDate(data.endTime) : 'INVALID_END_DATE';
+    # --- 1. Main Decoding Orchestrator ---
+    def _decode(self):
+        """Orchestrates the entire parsing process."""
+        self._parse_header()
+        self._determine_type()
+        self._parse_schedule()
+        self._parse_body() # This calls specific parsers based on type
+
+    # --- 2. Parsing Sub-Routines ---
+    def _parse_header(self):
+        """Uses reliable regex to extract the foundational fields."""
+        # NOTAM ID (e.g., A2170/25)
+        id_match = re.search(r'\(([A-Z]\d{4}/\d{2})', self.raw_text)
+        if id_match: self.notam_id = id_match.group(1)
         
-        const firstClause = clauses[0];
-        const isDailySameTime = clauses.length === 7 && clauses.every(c => c.startTime === firstClause.startTime && c.endTime === firstClause.endTime);
+        # Q-Line (e.g., Q)SKEC/QMRLC/...)
+        q_match = re.search(r'Q\)\s*\w{4}/(\w{5})/[\s\S]*?/(\d{3})/(\d{3})/', self.raw_text)
+        if q_match:
+            self.q_code = q_match.group(1)
+            self.vertical_limits['lower'] = f"FL{q_match.group(2)}"
+            self.vertical_limits['upper'] = f"FL{q_match.group(3)}"
 
-        if (isDailySameTime) {
-            // Simplified format for DAILY schedules with consistent times
-            const startTimeFmt = `${firstClause.startTime.slice(0, 2)}:${firstClause.startTime.slice(2)}`;
-            const endTimeFmt = `${firstClause.endTime.slice(0, 2)}:${firstClause.endTime.slice(2)}`;
-            timeDef = `TIMEDEF ${name} = ${overallStartFmt} TO ${overallEndFmt}: (${startTimeFmt} TO ${endTimeFmt});`;
-        } else {
-            const scheduleClauses = clauses.map(clause => {
-                const startTimeFmt = `${clause.startTime.slice(0, 2)}:${clause.startTime.slice(2)}`;
-                const endTimeFmt = `${clause.endTime.slice(0, 2)}:${clause.endTime.slice(2)}`;
-                const crossesMidnight = parseInt(clause.startTime, 10) >= parseInt(clause.endTime, 10);
-                const currentDay = clause.day.toUpperCase();
-
-                if (crossesMidnight) {
-                    const dayIndex = WEEK_DAYS.indexOf(currentDay);
-                    const nextDay = WEEK_DAYS[(dayIndex + 1) % 7];
-                    return `${currentDay} ${startTimeFmt} TO ${nextDay} ${endTimeFmt}`;
-                } else {
-                    return `${currentDay} ${startTimeFmt} TO ${currentDay} ${endTimeFmt}`;
-                }
-            });
-
-            if (scheduleClauses.length > 0) {
-                const timeDefPrefix = `TIMEDEF ${name} = ${overallStartFmt} TO ${overallEndFmt}: `;
-                const padding = ' '.repeat(timeDefPrefix.length + 1); // +1 for the opening parenthesis
-                const scheduleString = scheduleClauses.join(`,\n${padding}`);
-                timeDef = `${timeDefPrefix}(${scheduleString});`;
-            } else {
-                timeDef = `TIMEDEF ${name} = ${overallStartFmt} TO ${overallEndFmt};`;
-            }
-        }
-    } else if (data.dailyScheduleWithRanges && data.dailyScheduleWithRanges.length > 0 && data.startTime) {
-        const yearStr = data.startTime.substring(0, 2);
-        const startYear = 2000 + parseInt(yearStr, 10);
-        const startMonthIndex = parseInt(data.startTime.substring(2, 4), 10) - 1;
-
-        const sortedSchedule = [...data.dailyScheduleWithRanges].sort((a, b) => {
-            const monthAIndex = a.month ? MONTH_INDEX_MAP[a.month.toUpperCase()] : startMonthIndex;
-            const monthBIndex = b.month ? MONTH_INDEX_MAP[b.month.toUpperCase()] : startMonthIndex;
-
-            let yearA = startYear;
-            let yearB = startYear;
-
-            if (monthAIndex < startMonthIndex) yearA += 1;
-            if (monthBIndex < startMonthIndex) yearB += 1;
-
-            const dateA = new Date(Date.UTC(yearA, monthAIndex, a.startDay));
-            const dateB = new Date(Date.UTC(yearB, monthBIndex, b.startDay));
-
-            const dateComparison = dateA.getTime() - dateB.getTime();
-            if (dateComparison !== 0) return dateComparison;
-
-            const startTimeA = a.timeRanges?.[0]?.startTime ?? '0000';
-            const startTimeB = b.timeRanges?.[0]?.startTime ?? '0000';
-            return startTimeA.localeCompare(startTimeB);
-        });
-
-        const scheduleClauses = sortedSchedule.map(entry => {
-            const entryMonthIndex = entry.month ? MONTH_INDEX_MAP[entry.month.toUpperCase()] : startMonthIndex;
-            let entryYear = startYear;
-            if (entryMonthIndex < startMonthIndex) {
-                entryYear += 1;
-            }
-
-            const entryMonthStr = MONTHS[entryMonthIndex].toUpperCase();
-            const startDayStr = String(entry.startDay).padStart(2, '0');
-            const endDayStr = String(entry.endDay).padStart(2, '0');
-            
-            const linePrefix = `${startDayStr} ${entryMonthStr} ${entryYear} TO ${endDayStr} ${entryMonthStr} ${entryYear}:`;
-
-            const timeClauses = entry.timeRanges.map(range => {
-                const startTimeFmt = `${range.startTime.slice(0, 2)}:${range.startTime.slice(2)}`;
-                const endTimeFmt = `${range.endTime.slice(0, 2)}:${range.endTime.slice(2)}`;
-                return `(${startTimeFmt} TO ${endTimeFmt})`;
-            });
-            
-            const timePadding = ' '.repeat(linePrefix.length + 1);
-            const timeClausesStr = timeClauses.join(`,\n${timePadding}`);
-
-            return `${linePrefix}${timeClausesStr}`;
-        });
-
-        const timeDefPrefix = 'TIMEDEF DURATION = ';
-        const mainPadding = ' '.repeat(timeDefPrefix.length);
-        timeDef = `${timeDefPrefix}${scheduleClauses.join(`,\n${mainPadding}`)};`;
-    } else if (data.detailedSchedule && data.detailedSchedule.length > 0 && data.startTime) {
-        const yearStr = data.startTime.substring(0, 2);
-        const startMonthIndex = parseInt(data.startTime.substring(2, 4), 10) - 1;
-        const startYear = 2000 + parseInt(yearStr, 10);
+        # A) Airport, B) Start Time, C) End Time
+        a_match = re.search(r'A\)\s*(\w{4})', self.raw_text)
+        if a_match: self.airport = a_match.group(1)
         
-        const clauses = data.detailedSchedule.flatMap(entry => {
-            return entry.timeRanges.map(range => {
-                const startTimeFmt = `${range.startTime.slice(0, 2)}:${range.startTime.slice(2)}`;
-                const endTimeFmt = `${range.endTime.slice(0, 2)}:${range.endTime.slice(2)}`;
-                const isOvernight = parseInt(range.startTime, 10) >= parseInt(range.endTime, 10);
-    
-                const startDate = new Date(Date.UTC(startYear, startMonthIndex, entry.day));
-                
-                const endDate = new Date(startDate);
-                if (isOvernight) {
-                    endDate.setUTCDate(endDate.getUTCDate() + 1);
-                }
-    
-                const formatAirlangDateTime = (d: Date, time: string) => {
-                    const day = String(d.getUTCDate()).padStart(2, '0');
-                    const month = MONTHS[d.getUTCMonth()].toUpperCase();
-                    const year = d.getUTCFullYear();
-                    return `${day} ${month} ${year} ${time}`;
-                };
-                
-                const startStr = formatAirlangDateTime(startDate, startTimeFmt);
-                const endStr = formatAirlangDateTime(endDate, endTimeFmt);
-    
-                return `${startStr} TO ${endStr}`;
-            });
-        });
-    
-        const sortedClauses = clauses.sort((a, b) => {
-            const startA_str = a.split(' TO ')[0]; // "29 JUL 2025 22:00"
-            const startB_str = b.split(' TO ')[0];
-    
-            const partsA = startA_str.match(/(\d{2}) (\w{3}) (\d{4}) (\d{2}):(\d{2})/);
-            const partsB = startB_str.match(/(\d{2}) (\w{3}) (\d{4}) (\d{2}):(\d{2})/);
-    
-            if (!partsA || !partsB) return 0;
-    
-            const dateA = new Date(Date.UTC(
-                parseInt(partsA[3]),
-                MONTH_INDEX_MAP[partsA[2]],
-                parseInt(partsA[1]),
-                parseInt(partsA[4]),
-                parseInt(partsA[5])
-            ));
-            const dateB = new Date(Date.UTC(
-                parseInt(partsB[3]),
-                MONTH_INDEX_MAP[partsB[2]],
-                parseInt(partsB[1]),
-                parseInt(partsB[4]),
-                parseInt(partsB[5])
-            ));
-    
-            return dateA.getTime() - dateB.getTime();
-        });
+        b_match = re.search(r'B\)\s*(\d{10})', self.raw_text)
+        if b_match: self.start_time = datetime.strptime(b_match.group(1), '%y%m%d%H%M')
         
-        const timeDefPrefix = 'TIMEDEF DURATION = ';
-        const mainPadding = ' '.repeat(timeDefPrefix.length);
-        timeDef = `${timeDefPrefix}${sortedClauses.join(`,\n${mainPadding}`)};`;
-    } else if (data.complexSchedule && data.startTime && data.complexSchedule.dateRanges.length > 0 && data.complexSchedule.timeRanges.length > 0) {
-        const { dateRanges, timeRanges } = data.complexSchedule;
+        c_match = re.search(r'C\)\s*(\d{10})', self.raw_text)
+        if c_match: self.end_time = datetime.strptime(c_match.group(1), '%y%m%d%H%M')
+
+    def _determine_type(self):
+        """Uses the Q-Code to determine the fundamental NOTAM type."""
+        if not self.q_code: return
+        if self.q_code.startswith('QMR'): self.notam_type = 'RUNWAY'
+        elif self.q_code.startswith('QRT') or self.q_code.startswith('QW'): self.notam_type = 'AREA'
+        elif self.q_code.startswith('QFA'): self.notam_type = 'AERODROME_HOURS' # Can affect runways
+
+    def _parse_schedule(self):
+        """Decodes the D) or E) field to understand the active schedule."""
+        d_match = re.search(r'D\)(.*?)(?=\n[A-Z]\)|$)', self.raw_text, re.DOTALL)
+        e_match = re.search(r'E\)(.*?)(?=\n[F-Z]|\Z)', self.raw_text, re.DOTALL)
+
+        if d_match:
+            d_content = d_match.group(1).strip()
+            if "DAILY" in d_content:
+                self.schedule['type'] = 'DAILY'
+                time_match = re.search(r'(\d{4})-(\d{4})', d_content)
+                self.schedule['rules'] = {'DAILY': [time_match.group(0)]}
+            elif any(day in d_content for day in ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]):
+                self.schedule['type'] = 'WEEKLY'
+                self.schedule['rules'] = self._decode_weekly_schedule(d_content)
+            else: # D field with specific dates (e.g., 03-07 10)
+                self.schedule['type'] = 'SPECIFIC_DATES'
+                self.schedule['rules'] = self._decode_date_range_schedule(d_content)
+        elif e_match:
+             # E field with specific dates (e.g., JUL 30)
+            if any(month in e_match.group(1) for month in ["JUL", "AUG", "SEP"]):
+                self.schedule['type'] = 'SPECIFIC_DATES'
+                self.schedule['rules'] = self._decode_specific_date_schedule(e_match.group(1))
+
+    def _parse_body(self):
+        """Routes to a specific parser based on the determined NOTAM type."""
+        e_match = re.search(r'E\)(.*?)(?=\n[F-Z]|\Z)', self.raw_text, re.DOTALL)
+        e_content = e_match.group(1).strip() if e_match else ""
+
+        if self.notam_type == 'AREA':
+            self._parse_area_details(e_content)
+        elif self.notam_type == 'RUNWAY' or self.notam_type == 'AERODROME_HOURS':
+            # Use the entire NOTAM text as context for runway info
+            self._parse_runway_details(self.raw_text)
+
+    # --- 3. Specialized "Decoder" Sub-Routines ---
+    def _decode_weekly_schedule(self, d_content):
+        # Uses NLP to handle complex weekly schedules like "MON FRI 0800-1200"
+        rules = {}
+        days_of_week = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+        for line in d_content.split('\n'):
+            doc = nlp(line.strip())
+            days_on_line = [tok.text for tok in doc if tok.text in days_of_week]
+            times_on_line = [tok.text for tok in doc if re.fullmatch(r'\d{4}-\d{4}', tok.text)]
+            for day in days_on_line:
+                if day not in rules: rules[day] = []
+                rules[day].extend(times_on_line)
+        return rules
+    
+    def _decode_date_range_schedule(self, d_content):
+        rules = {}
+        time_match = re.search(r'(\d{4}-\d{4})', d_content)
+        if not time_match: return {}
+        time_range = time_match.group(1)
+        date_part = d_content.replace(time_range, '').strip()
+        days = []
+        for match in re.finditer(r'(\d{2})-(\d{2})|(\d{2})', date_part):
+            if match.group(1): days.extend(range(int(match.group(1)), int(match.group(2)) + 1))
+            else: days.append(int(match.group(3)))
+        month = self.start_time.month
+        year = self.start_time.year
+        for day in days:
+            date_key = datetime(year, month, day).strftime('%d %b').upper()
+            rules[date_key] = [time_range]
+        return rules
+
+    def _decode_specific_date_schedule(self, e_content):
+        rules = {}
+        current_month = None
+        year = self.start_time.year
+        for line in e_content.split('\n'):
+            line = line.strip()
+            month_match = re.match(r'([A-Z]{3})\s+([\d\s]+)\s+(\d{4}-\d{4})', line)
+            if month_match:
+                current_month = datetime.strptime(month_match.group(1), '%b').month
+                days_str, time_range = month_match.group(2).strip(), month_match.group(3)
+                for day in [int(d) for d in days_str.split()]:
+                    date_key = datetime(year, current_month, day).strftime('%d %b').upper()
+                    rules[date_key] = [time_range]
+        return rules
+
+    def _parse_area_details(self, e_content):
+        # Circle
+        circle_match = re.search(r'CIRCLE RADIUS (\d+NM) CENTERED ON (\d{6}[NS]\d{7}[EW])', e_content)
+        if circle_match:
+            self.geometry['type'] = 'CIRCLE'
+            self.geometry['radius'] = circle_match.group(1).replace('NM', ' NM')
+            lat, lon = circle_match.group(2)[:7], circle_match.group(2)[7:]
+            self.geometry['center'] = f"{lat[:4]}{lat[6]}N{lon[:5]}{lon[7]}E+A+P" # Simplified format
+            return
+
+        # Polygon
+        coords = re.findall(r'(\d{6}[NS]\d{7}[EW])', e_content)
+        if coords:
+            self.geometry['type'] = 'POLYGON'
+            self.geometry['points'] = [f"{c[:4]}{c[6]}{c[7:12]}{c[14]}+A+P" for c in coords]
+
+    def _parse_runway_details(self, text_content):
+        rwy_match = re.search(r'RWY\s+(\d{2}/\d{2})\s+CLSD', text_content)
+        if rwy_match:
+            self.subject['identifier'] = rwy_match.group(1)
+            self.subject['status'] = "CLOSED"
+
+    # --- 4. AIRlang Formatting ---
+    def format_airlang(self):
+        """Builds the final AIRlang string from the parsed data."""
+        if self.notam_type == "UNKNOWN": return "Could not determine NOTAM type."
         
-        const yearStr = data.startTime.substring(0, 2);
-        const monthIndex = parseInt(data.startTime.substring(2, 4), 10) - 1;
-        const year = 2000 + parseInt(yearStr, 10);
-        const month = MONTHS[monthIndex];
-        
-        const sortedDateRanges = [...dateRanges].sort((a, b) => a.startDay - b.startDay);
-
-        const timeClauses = timeRanges.map(range => {
-            const startTimeFmt = `${range.startTime.slice(0, 2)}:${range.startTime.slice(2)}`;
-            const endTimeFmt = `${range.endTime.slice(0, 2)}:${range.endTime.slice(2)}`;
-            return `(${startTimeFmt} TO ${endTimeFmt})`;
-        });
-    
-        const scheduleClauses = sortedDateRanges.map(dr => {
-            const startDay = String(dr.startDay).padStart(2, '0');
-            const endDay = String(dr.endDay).padStart(2, '0');
-    
-            const earliestTime = timeRanges[0].startTime;
-            const latestTime = timeRanges[timeRanges.length - 1].endTime;
-            const earliestTimeFmt = `${earliestTime.slice(0, 2)}:${earliestTime.slice(2)}`;
-            const latestTimeFmt = `${latestTime.slice(0, 2)}:${latestTime.slice(2)}`;
-            
-            const linePrefix = `${startDay} ${month} ${year} ${earliestTimeFmt} TO ${endDay} ${month} ${year} ${latestTimeFmt}: `;
-            const timePadding = ' '.repeat(linePrefix.length);
-    
-            const timeClausesStr = timeClauses.join(`,\n${timePadding}`);
-    
-            return `${linePrefix}${timeClausesStr}`;
-        });
-    
-        const timeDefPrefix = 'TIMEDEF DURATION = ';
-        const mainPadding = ' '.repeat(timeDefPrefix.length);
-        timeDef = `${timeDefPrefix}${scheduleClauses.join(`,\n${mainPadding}`)};`;
-    } else if (data.multiTimeRangeSchedule && data.multiTimeRangeSchedule.length > 0 && data.startTime && data.endTime) {
-        const overallStartFmt = formatAirlangDate(data.startTime);
-        const overallEndFmt = formatAirlangDate(data.endTime);
-
-        const scheduleClauses = data.multiTimeRangeSchedule.map(range => {
-            const startTimeFmt = `${range.startTime.slice(0, 2)}:${range.startTime.slice(2)}`;
-            const endTimeFmt = `${range.endTime.slice(0, 2)}:${range.endTime.slice(2)}`;
-            return `(${startTimeFmt} TO ${endTimeFmt})`;
-        });
-        
-        const timeDefPrefix = `TIMEDEF DURATION = ${overallStartFmt} TO ${overallEndFmt}:`;
-        const padding = ' '.repeat(timeDefPrefix.length + 1);
-        const scheduleString = scheduleClauses.join(`,\n${padding}`);
-        timeDef = `${timeDefPrefix}${scheduleString};`;
-
-    } else if (data.parsedSchedule && data.parsedSchedule.length > 0) {
-        // Handle special DLY case
-        if (data.parsedSchedule[0]?.month === 'DLY') {
-            const schedule = data.parsedSchedule[0];
-            const startTimeFmt = `${schedule.startTime.slice(0, 2)}:${schedule.startTime.slice(2)}`;
-            const endTimeFmt = `${schedule.endTime.slice(0, 2)}:${schedule.endTime.slice(2)}`;
-            const overallStartFmt = data.startTime ? formatAirlangDate(data.startTime) : 'INVALID_START_DATE';
-            const overallEndFmt = data.endTime ? formatAirlangDate(data.endTime) : 'INVALID_END_DATE';
-            timeDef = `TIMEDEF DURATION = ${overallStartFmt} TO ${overallEndFmt}: (${startTimeFmt} TO ${endTimeFmt});`;
-        } else {
-             // Sort schedule chronologically
-            const sortedSchedule = [...data.parsedSchedule].sort((a, b) => {
-                let startYear = 2024; // Default
-                let startMonthIndex = 0; // Default
-                if (data.startTime && /^\d{10}$/.test(data.startTime)) {
-                    startYear = 2000 + parseInt(data.startTime.substring(0, 2), 10);
-                    startMonthIndex = parseInt(data.startTime.substring(2, 4), 10) - 1;
-                }
-                
-                const monthA = MONTH_INDEX_MAP[a.month.toUpperCase()];
-                const monthB = MONTH_INDEX_MAP[b.month.toUpperCase()];
-
-                let yearA = startYear;
-                let yearB = startYear;
-
-                if (monthA < startMonthIndex) yearA += 1;
-                if (monthB < startMonthIndex) yearB += 1;
-
-                const dateA = new Date(Date.UTC(yearA, monthA, a.day));
-                const dateB = new Date(Date.UTC(yearB, monthB, b.day));
-
-                const dateComparison = dateA.getTime() - dateB.getTime();
-                if (dateComparison !== 0) return dateComparison;
-
-                // If dates are the same, sort by start time
-                return a.startTime.localeCompare(b.startTime);
-            });
-
-            const formattedClauses = sortedSchedule.map(clause => {
-                const startTime = `${clause.startTime.slice(0,2)}:${clause.startTime.slice(2)}`;
-                const endTime = `${clause.endTime.slice(0,2)}:${clause.endTime.slice(2)}`;
-                const monthUpperCase = clause.month.toUpperCase();
-                return `${String(clause.day).padStart(2, '0')} ${monthUpperCase}: (${startTime} TO ${endTime})`
-            });
-            
-            const padding = 'TIMEDEF DURATION = '.length;
-            timeDef = `TIMEDEF DURATION = ${formattedClauses.join(`,\n${' '.repeat(padding)}`)};`;
-        }
-
-    } else if (data.startTime && data.endTime) {
-        timeDef = `TIMEDEF DURATION = ${formatAirlangDate(data.startTime)} TO ${formatAirlangDate(data.endTime)};`;
-    } else {
-        return { 
-            code: '', 
-            error: "Unable to generate AIRlang: Time definition is missing (e.g., B/C fields or schedule)." 
-        };
-    }
-
-    let ruleDef = '';
-    
-    let effectiveNotamType = data.notamType;
-    if (data.notamType === NotamType.UNKNOWN && data.areaDefinitions && data.areaDefinitions.length > 0) {
-        effectiveNotamType = NotamType.RESTRICTED_AREA_ACTIVATION;
-    }
-
-    const handleAreaActivation = (type: 'DANGER' | 'MILITARY' | 'RESTRICTED') => {
-        if (data.aerodromes && data.aerodromes.length > 0 && data.areaDefinitions && data.areaDefinitions.length > 0) {
-            const areaRules = data.areaDefinitions.map((area: AreaDefinition, index: number) => {
-                const lowerFL = feetToFlightLevel(area.lowerAltitudeFeet);
-                const upperFL = feetToFlightLevel(area.upperAltitudeFeet);
-                
-                // Per user examples, lower bound 'SFC' (FL000) should be represented as FL001
-                const effectiveLowerFL = lowerFL === 'FL000' ? 'FL001' : lowerFL;
-                
-                let geometryDef = '';
-                if (area.polygon && area.polygon.length > 0) {
-                    const polygonCoords = area.polygon
-                        .map(formatAirlangCoordinate)
-                        .join(',\n            ');
-                    geometryDef = `POLYGON(${polygonCoords})`;
-                } else if (area.circle) {
-                    const centerCoord = formatAirlangCoordinate(area.circle.center);
-                    geometryDef = `CIRCLE(${centerCoord}, ${area.circle.radiusNM} NM)`;
-                } else {
-                    return `// ERROR: Area ${index + 1} has no valid geometry (polygon or circle).`;
-                }
-
-                const hasMultipleAreas = data.areaDefinitions.length > 1;
-                const areaSuffix = hasMultipleAreas ? String.fromCharCode('A'.charCodeAt(0) + index) : '';
-                const notamIdPart = data.notamId || 'NO_ID';
-                const aerodromesStr = [...data.aerodromes].sort().join(',');
-                const areaDefName = `"${aerodromesStr}_${notamIdPart}${areaSuffix}"`;
-    
-                return `AREADEF ${areaDefName}\n    ${effectiveLowerFL} TO ${upperFL}\n    TYPE(${type})\n    ${geometryDef}\n    ACTIVE DURATION;`;
-            });
-            ruleDef = areaRules.join('\n\n');
-        }
-    };
-
-    switch (effectiveNotamType) {
-        case NotamType.RUNWAY_CLOSURE:
-            if (data.aerodromes?.[0] && data.affectedElement) {
-                const runwayDesignator = data.affectedElement.replace(/^RWY\s+/i, '');
-                ruleDef = `RWYDEF ${data.aerodromes[0]} ${runwayDesignator} CLOSED DURATION;`;
-            }
-            break;
-        case NotamType.TAXIWAY_CLOSURE:
-            if (data.aerodromes?.[0] && data.affectedElement) ruleDef = `TWYDEF ${data.aerodromes[0]} ${data.affectedElement} CLOSED DURATION;`;
-            break;
-        case NotamType.APRON_CLOSURE:
-            if (data.aerodromes?.[0] && data.affectedElement) ruleDef = `APRONDEF ${data.aerodromes[0]} ${data.affectedElement} CLOSED DURATION;`;
-            break;
-        case NotamType.NAVAID_UNSERVICEABLE:
-             if (data.aerodromes?.[0] && data.affectedElement) ruleDef = `NAVAID ${data.aerodromes[0]} ${data.affectedElement} U/S DURATION;`;
-            break;
-        case NotamType.LIGHTING_FAILURE:
-             if (data.aerodromes?.[0] && data.affectedElement) ruleDef = `LIGHTING ${data.aerodromes[0]} ${data.affectedElement} U/S DURATION;`;
-            break;
-        case NotamType.AIRSPACE_ACTIVATION:
-            if (data.airspaceType && data.airspaceId) ruleDef = `AIRSPACE ${data.airspaceId} TYPE ${data.airspaceType} ACTIVE DURATION;`;
-            break;
-        case NotamType.DANGER_AREA_ACTIVATION:
-            handleAreaActivation('DANGER');
-            break;
-        case NotamType.MILITARY_AREA_ACTIVATION:
-            handleAreaActivation('MILITARY');
-            break;
-        case NotamType.RESTRICTED_AREA_ACTIVATION:
-            handleAreaActivation('RESTRICTED');
-            break;
-        default:
-            return {
-                code: `// AI Analysis complete, but no specific rule generated.\n// Reason: ${data.reason || 'Unknown'}\n${timeDef}`,
-                error: "Could not determine a known NOTAM type to generate a specific AIRlang rule."
-            };
-    }
-    
-    if (!ruleDef) {
-        return {
-            code: `// Rule generation failed. Please check the parsed output for missing information.\n${timeDef}`,
-            error: "Failed to generate a complete AIRlang rule. The AI parsed the data, but required elements were missing or couldn't be identified."
-        };
-    }
-
-    if (data.recurringSchedule && data.recurringSchedule.timeDefName) {
-        ruleDef = ruleDef.replace(/DURATION/g, data.recurringSchedule.timeDefName);
-    }
-
-    return { code: `${timeDef}\n\n${ruleDef}` };
-};
-
-const App: React.FC = () => {
-    const [notamText, setNotamText] = useState<string>('');
-    const [parsedData, setParsedData] = useState<ParsedNotam | null>(null);
-    const [airlangCode, setAirlangCode] = useState<string>('');
-    const [isLoading, setIsLoading] = useState<boolean>(false);
-    const [error, setError] = useState<string | null>(null);
-
-    const handleAnalyze = useCallback(async () => {
-        if (!notamText.trim()) {
-            setError("Please enter a NOTAM to analyze.");
-            return;
-        }
-        setIsLoading(true);
-        setError(null);
-        setParsedData(null);
-        setAirlangCode('');
-
-        try {
-            const data = await parseNotamWithAI(notamText);
-            setParsedData(data);
-            const result = generateAirlang(data);
-            if (result.error) {
-                setError(result.error);
-            }
-            setAirlangCode(result.code);
-        } catch (e) {
-            console.error(e);
-            setError(e instanceof Error ? `An error occurred: ${e.message}` : "An unknown error occurred during analysis.");
-        } finally {
-            setIsLoading(false);
-        }
-    }, [notamText]);
-    
-    const handleClear = useCallback(() => {
-        setNotamText('');
-        setParsedData(null);
-        setAirlangCode('');
-        setError(null);
-    }, []);
-
-    return (
-        <div className="min-h-screen bg-[#18191F] font-sans p-4 sm:p-8 lg:p-12">
-            <div className="max-w-screen-2xl mx-auto">
-                <header className="mb-12">
-                    <div className="flex justify-center items-baseline gap-4">
-                         <h1 className="text-5xl font-black bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent" style={{ fontFamily: "'Inter', sans-serif" }}>
-                            FLYLANG
-                        </h1>
-                        <p className="text-lg text-gray-400">
-                            I speak fluent NOTAM
-                        </p>
-                    </div>
-                </header>
-
-                <main className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    <div className="flex flex-col gap-8 animate-fade-in-up" style={{ opacity: 0 }}>
-                        <NotamInput 
-                            value={notamText}
-                            onChange={(e) => setNotamText(e.target.value)}
-                            onAnalyze={handleAnalyze}
-                            onClear={handleClear}
-                            isLoading={isLoading}
-                        />
-
-                        {error && (
-                            <div className="bg-red-500/10 border border-red-500/30 text-red-300 p-4 rounded-xl flex items-start gap-3">
-                                <AlertTriangle className="h-5 w-5 mt-0.5 flex-shrink-0 text-red-400" />
-                                <span className="font-medium">{error}</span>
-                            </div>
-                        )}
-
-                        <div className="bg-[#242631] rounded-2xl shadow-2xl shadow-black/20">
-                            <div className="p-5 border-b border-white/10">
-                                <h2 className="flex items-center gap-3 text-lg font-bold text-white">
-                                    <ClipboardList className="h-6 w-6 text-cyan-400" />
-                                    <span>NOTAM Analysis</span>
-                                </h2>
-                            </div>
-                            <div className="p-6">
-                                <ParsedOutput data={parsedData} isLoading={isLoading} />
-                            </div>
-                        </div>
-                    </div>
-
-                    <div 
-                        className="bg-[#242631] rounded-2xl shadow-2xl shadow-black/20 animate-fade-in-up" 
-                        style={{ opacity: 0, animationDelay: '200ms' }}
-                    >
-                        <div className="p-5 border-b border-white/10">
-                            <h2 className="flex items-center gap-3 text-lg font-bold text-white">
-                                <FileText className="h-6 w-6 text-cyan-400" />
-                                <span>Generated AIRlang Code</span>
-                            </h2>
-                        </div>
-                        <div className="p-6">
-                           <AirlangOutput code={airlangCode} isLoading={isLoading} />
-                        </div>
-                    </div>
-                </main>
-                 <footer className="text-center mt-12 py-6">
-                    <p className="text-gray-500 text-sm">
-                        Powered by Gemini AI. Flylang is a tool to assist, not replace, expert analysis.
-                    </p>
-                </footer>
-            </div>
-        </div>
-    );
-};
-
-export default App;
+        timedef = self._format_timedef()
+        maindef = ""
+        if self.notam_ty
